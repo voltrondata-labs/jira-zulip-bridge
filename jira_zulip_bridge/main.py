@@ -5,35 +5,42 @@ import requests
 import datetime
 import os
 import pytz
+import re
+import time
 import zulip
 
 # JIRA REST API URL to query
 JIRA_URL = ("https://issues.apache.org/jira/rest/api/2/search?"
-            "jql=project=%s%%20AND%%20updated%%3E=-15m&"
+            "jql=project=%s%%20AND%%20updated%%3E=-%dm&"
             "expand=changelog&fields=changelog,summary,creator,description")
 
-EMAIL = 'arrow-jira-bot@ursalabs.zulipchat.com'
 JIRA_USERNAME = os.environ['APACHE_JIRA_USERNAME']
 JIRA_PASS = os.environ['APACHE_JIRA_PASSWORD']
-API_KEY = os.environ['ZULIP_JIRA_API_KEY']
 DESCRIPTION_LIMIT = 10000
+OLD_MESSAGES_LOOKBACK = 100
+JIRA_API_LOOKBACK_MINUTES = 15
+CHANGE_IGNORED_FIELDS = {'WorklogId', 'timespent', 'RemoteIssueLink'}
 
 
 class ZulipJiraBot:
 
-    def __init__(self, email, api_key, jira_project, stream='test-jira'):
+    def __init__(self, site, email, api_key, jira_project, stream):
+        self.site = site
         self.email = email
         self.api_key = api_key
         self.jira_project = jira_project
         self.stream = stream
 
-        self.jira_rest_url = self.JIRA_URL % self.jira_project
+        self.jira_rest_url = JIRA_URL % (self.jira_project,
+                                         JIRA_API_LOOKBACK_MINUTES)
 
-        self.client = zulip.Client(email=self.email, api_key=self.api_key)
+        self.client = zulip.Client(email=self.email, api_key=self.api_key,
+                                   site=self.site)
 
         # Keep a set of hash((topic, content)) values so we don't send
         # duplicate messages to the stream
-        self.content_hashes = set()
+        self.prior_content = []
+        self.prior_event_ids = set()
 
         # Change event ids we've already processed in this process
         self.processed_change_ids = set()
@@ -47,7 +54,7 @@ class ZulipJiraBot:
         # thing multiple times if the bot is restarted
         request = {
             'anchor': 'newest',
-            'num_before': 1000,
+            'num_before': OLD_MESSAGES_LOOKBACK,
             'num_after': 0,
             'narrow': [{'operator': 'sender', 'operand': self.email},
                        {'operator': 'stream', 'operand': self.stream}],
@@ -55,18 +62,17 @@ class ZulipJiraBot:
         result = self.client.get_messages(request)
 
         for message in result['messages']:
-            self._observe_message(message['subject'], message['content'])
+            content = message['content']
+            m = re.findall(r'event_id: ([\d]+)', content)
+            if len(m) == 1:
+                try:
+                    self.prior_event_ids.add(int(m[0]))
+                except ValueError:
+                    pass
 
-    def _observe_message(self, topic, content):
-        key = hash((topic, content))
-        self.content_hashes.add(key)
-
-    def _already_sent_message(self, topic, content):
-        key = hash((topic, content))
-        return key in self.content_hashes
-
-    def _send_message(self, topic, content):
-        if self._already_sent_message(topic, content):
+    def _send_message(self, event_id, topic, content):
+        if event_id in self.prior_event_ids:
+            print("Skipping message already sent to stream")
             return
 
         request = {
@@ -79,9 +85,12 @@ class ZulipJiraBot:
         import pprint
         pprint.pprint(request)
 
-        # result = self.client.send_message(request)
-        self._observe_message(topic, content)
-        # return result
+        import pdb
+        pdb.set_trace()
+
+        result = self.client.send_message(request)
+        self.prior_event_ids.add(event_id)
+        return result
 
     def process_latest(self):
         events = self._get_latest_jira_events()
@@ -89,12 +98,6 @@ class ZulipJiraBot:
         now = datetime.datetime.now(pytz.utc)
         for issue in events['issues']:
             for entry in issue['changelog']['histories']:
-                change_id = int(entry['id'])
-                if change_id in self.processed_change_ids:
-                    continue
-
-                self.processed_change_ids.add(change_id)
-
                 when = datetime.datetime.strptime(entry['created'],
                                                   '%Y-%m-%dT%H:%M:%S.%f%z')
                 CHANGE_LOOKBACK_SECONDS = 900
@@ -121,57 +124,105 @@ class ZulipJiraBot:
             }
 
     def send_new_ticket(self, issue):
-        author = issue['fields']['creator']['displayName']
-        assignee = issue['fields']['assignee']['displayName']
+        issue_id = int(issue['id'])
+        if issue_id in self.prior_event_ids:
+            print("Skipping new issue with id {}".format(issue_id))
+            return
+
+        fields = issue['fields']
+
+        author = fields['creator']['displayName']
+
+        if 'assignee' in fields:
+            assignee = fields['assignee']['displayName']
+        else:
+            assignee = 'UNASSIGNED'
+
         key = issue['key']
-        title = issue['fields']['summary']
-        desc = issue['fields'].get('description')
+        title = fields['summary']
+        desc = fields.get('description')
         if len(desc) > DESCRIPTION_LIMIT:
             desc = desc[:DESCRIPTION_LIMIT] + "..."
 
-        priority = 'ADDME'
+        prefixed_title = '{}: {}'.format(key, title)
+        topic = prefixed_title
 
-        topic = title
+        # TODO: Priority does not seem to be returned by the JIRA API
+        # priority = fields['priority']
+        # * **Priority**: {}
+
         content = """{} created {}:
-* **Priority**: {}
+
 * **Assignee**: {}
 
-{}""".format(author, _issue_markdown_link(title, key), priority,
-             assignee, desc)
-        return self._send_message(topic, content)
+{} (event_id: {})""".format(author, _issue_markdown_link(prefixed_title, key),
+                            assignee, desc, int(issue['id']))
+        return self._send_message(issue_id, topic, content)
 
-    def send_ticket_change_event(self, entry):
+    def send_ticket_change_event(self, issue, change):
         """ Parse changelog and format it for humans """
-        author = entry['change']['author']['displayName']
-        title = entry['summary']
-        key = entry['key']
+        author = change['author']['displayName']
+        title = issue['fields']['summary']
+        key = issue['key']
 
-        topic = title
-        content = """{} created {}:
-{}"""
+        change_id = int(change['id'])
+        if change_id in self.prior_event_ids:
+            print("Skipping change with id {}".format(change_id))
+            return
+
+        prefixed_title = '{}: {}'.format(key, title)
+        topic = prefixed_title
+
+        content = """{} updated {}:
+
+{}
+
+(event_id: {})"""
 
         change_lines = []
-        for item in entry['change']['items']:
+        for item in change['items']:
             field = item.get('field')
+
+            if field in CHANGE_IGNORED_FIELDS:
+                continue
+
             from_string = item.get('fromString')
             to_string = item.get('toString')
 
             to_string = to_string or "Unresolved"
             if from_string is None:
-                line = 'Changed {} to **{}**'.format(field, to_string)
+                line = '* Changed {} to **{}**'.format(field, to_string)
             else:
-                line = ('Changed {} from **{}** to **{}**'
+                line = ('* Changed {} from **{}** to **{}**'
                         .format(field, from_string, to_string))
 
             change_lines.append(line)
 
+        if len(change_lines) == 0:
+            print("Ignoring change id {}".format(change_id))
+            return
+
         formatted_content = content.format(
-            author, _issue_markdown_link(title, key),
-            change_lines.join('\n')
+            author, _issue_markdown_link(prefixed_title, key),
+            '\n'.join(change_lines), int(change['id'])
         )
-        return self._send_message(topic, formatted_content)
+        return self._send_message(change_id, topic, formatted_content)
 
 
 def _issue_markdown_link(title, key):
     return ('[{}](https://issues.apache.org/jira/browse/{})'
             .format(title, key))
+
+
+if __name__ == '__main__':
+    EMAIL = 'helper-bot@zulipchat.com'
+    API_KEY = os.environ['ZULIP_JIRA_API_KEY']
+    PROJECT = 'ARROW'
+    STREAM = 'jira'
+    ZULIP_SITE = 'https://ursalabs.zulipchat.com'
+
+    bot = ZulipJiraBot(ZULIP_SITE, EMAIL, API_KEY, PROJECT, STREAM)
+
+    while True:
+        bot.process_latest()
+        time.sleep(60)
