@@ -42,9 +42,6 @@ class ZulipJiraBot:
         self.prior_content = []
         self.prior_event_ids = set()
 
-        # Change event ids we've already processed in this process
-        self.processed_change_ids = set()
-
         self.last_new_ticket = '{}-00000'.format(self.jira_project)
 
         self._get_recent_messages()
@@ -72,7 +69,6 @@ class ZulipJiraBot:
 
     def _send_message(self, event_id, topic, content):
         if event_id in self.prior_event_ids:
-            print("Skipping message already sent to stream")
             return
 
         request = {
@@ -84,9 +80,6 @@ class ZulipJiraBot:
 
         import pprint
         pprint.pprint(request)
-
-        import pdb
-        pdb.set_trace()
 
         result = self.client.send_message(request)
         self.prior_event_ids.add(event_id)
@@ -126,7 +119,6 @@ class ZulipJiraBot:
     def send_new_ticket(self, issue):
         issue_id = int(issue['id'])
         if issue_id in self.prior_event_ids:
-            print("Skipping new issue with id {}".format(issue_id))
             return
 
         fields = issue['fields']
@@ -167,7 +159,6 @@ class ZulipJiraBot:
 
         change_id = int(change['id'])
         if change_id in self.prior_event_ids:
-            print("Skipping change with id {}".format(change_id))
             return
 
         prefixed_title = '{}: {}'.format(key, title)
@@ -200,6 +191,7 @@ class ZulipJiraBot:
 
         if len(change_lines) == 0:
             print("Ignoring change id {}".format(change_id))
+            self.prior_event_ids.add(change_id)
             return
 
         formatted_content = content.format(
@@ -224,5 +216,6 @@ if __name__ == '__main__':
     bot = ZulipJiraBot(ZULIP_SITE, EMAIL, API_KEY, PROJECT, STREAM)
 
     while True:
+        print("Processing latest events")
         bot.process_latest()
-        time.sleep(60)
+        time.sleep(5)
