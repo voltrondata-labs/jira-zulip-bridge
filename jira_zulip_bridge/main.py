@@ -7,19 +7,23 @@ import os
 import pytz
 import re
 import time
+import traceback
 import zulip
 
 # JIRA REST API URL to query
 JIRA_URL = ("https://issues.apache.org/jira/rest/api/2/search?"
             "jql=project=%s%%20AND%%20updated%%3E=-%dm&"
-            "expand=changelog&fields=changelog,summary,creator,description")
+            "expand=changelog&"
+            "fields=changelog,summary,creator,description")
 
 JIRA_USERNAME = os.environ['APACHE_JIRA_USERNAME']
 JIRA_PASS = os.environ['APACHE_JIRA_PASSWORD']
 DESCRIPTION_LIMIT = 10000
 OLD_MESSAGES_LOOKBACK = 100
-JIRA_API_LOOKBACK_MINUTES = 15
-CHANGE_IGNORED_FIELDS = {'WorklogId', 'timespent', 'RemoteIssueLink'}
+JIRA_API_LOOKBACK_MINUTES = 60
+CHANGE_IGNORED_FIELDS = {'WorklogId', 'timespent', 'RemoteIssueLink',
+                         'timeestimate'}
+CHANGE_LOOKBACK_SECONDS = JIRA_API_LOOKBACK_MINUTES * 60
 
 
 class ZulipJiraBot:
@@ -67,6 +71,11 @@ class ZulipJiraBot:
                 except ValueError:
                     pass
 
+    def _get_issue_comments(self, key):
+        url = ("https://issues.apache.org/jira/rest/api/2/issue/"
+               "{}/comment".format(key))
+        return self._make_jira_request(url)
+
     def _send_message(self, event_id, topic, content):
         if event_id in self.prior_event_ids:
             return
@@ -85,19 +94,24 @@ class ZulipJiraBot:
         self.prior_event_ids.add(event_id)
         return result
 
-    def process_latest(self):
-        events = self._get_latest_jira_events()
-
+    def _is_recent_event(self, event_timestamp):
         now = datetime.datetime.now(pytz.utc)
+        when = _parse_jira_timestamp(event_timestamp)
+        return (now - when).total_seconds() < CHANGE_LOOKBACK_SECONDS
+
+    def process_latest(self):
+        events = self._make_jira_request(self.jira_rest_url)
+
         for issue in events['issues']:
-            for entry in issue['changelog']['histories']:
-                when = datetime.datetime.strptime(entry['created'],
-                                                  '%Y-%m-%dT%H:%M:%S.%f%z')
-                CHANGE_LOOKBACK_SECONDS = 900
-
-                if (now - when).seconds > CHANGE_LOOKBACK_SECONDS:
+            issue_comments = self._get_issue_comments(issue['key'])
+            for comment in issue_comments['comments']:
+                if not self._is_recent_event(comment['updated']):
                     continue
+                self.send_comment_event(issue, comment)
 
+            for entry in issue['changelog']['histories']:
+                if not self._is_recent_event(entry['created']):
+                    continue
                 self.send_ticket_change_event(issue, entry)
 
             # Newly created issue?
@@ -106,9 +120,9 @@ class ZulipJiraBot:
                 self.last_new_ticket = issue['key']
                 self.send_new_ticket(issue)
 
-    def _get_latest_jira_events(self):
+    def _make_jira_request(self, request):
         try:
-            return requests.get(self.jira_rest_url,
+            return requests.get(request,
                                 auth=(JIRA_USERNAME, JIRA_PASS)).json()
         except Exception:
             print("Could not contact JIRA, faking empty reply")
@@ -170,6 +184,11 @@ class ZulipJiraBot:
 
 (event_id: {})"""
 
+        field_defaults = {
+            'resolution': 'Unresolved',
+            'labels': '(no labels)'
+        }
+
         change_lines = []
         for item in change['items']:
             field = item.get('field')
@@ -180,7 +199,8 @@ class ZulipJiraBot:
             from_string = item.get('fromString')
             to_string = item.get('toString')
 
-            to_string = to_string or "Unresolved"
+            to_string = to_string or field_defaults.get(field, "(empty)")
+
             if from_string is None:
                 line = '* Changed {} to **{}**'.format(field, to_string)
             else:
@@ -196,9 +216,44 @@ class ZulipJiraBot:
 
         formatted_content = content.format(
             author, _issue_markdown_link(prefixed_title, key),
-            '\n'.join(change_lines), int(change['id'])
+            '\n'.join(change_lines), change_id
         )
         return self._send_message(change_id, topic, formatted_content)
+
+    def send_comment_event(self, issue, comment):
+        author = comment['author']['displayName']
+        title = issue['fields']['summary']
+        key = issue['key']
+
+        comment_id = int(comment['id'])
+        if comment_id in self.prior_event_ids:
+            return
+
+        prefixed_title = '{}: {}'.format(key, title)
+        topic = prefixed_title
+
+        if comment['updated'] != comment['created']:
+            action = 'updated comment'
+        else:
+            action = 'posted new comment'
+
+        content = """{} {} on {}:
+
+When: {}
+
+{}
+
+(event_id: {})"""
+
+        formatted_content = content.format(
+            author, action, _issue_markdown_link(prefixed_title, key),
+            comment['updated'], comment['body'], comment_id
+        )
+        return self._send_message(comment_id, topic, formatted_content)
+
+
+def _parse_jira_timestamp(stamp):
+    return datetime.datetime.strptime(stamp, '%Y-%m-%dT%H:%M:%S.%f%z')
 
 
 def _issue_markdown_link(title, key):
@@ -216,6 +271,12 @@ if __name__ == '__main__':
     bot = ZulipJiraBot(ZULIP_SITE, EMAIL, API_KEY, PROJECT, STREAM)
 
     while True:
-        print("Processing latest events")
-        bot.process_latest()
+        now = datetime.datetime.now(pytz.utc)
+        print("{}: Processing latest events"
+              .format(now.strftime("%Y-%m-%d %H:%M:%S %Z")))
+        try:
+            bot.process_latest()
+        except Exception:
+            traceback.print_exc()
+
         time.sleep(5)
