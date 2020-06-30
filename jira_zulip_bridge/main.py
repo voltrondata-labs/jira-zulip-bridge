@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import requests
 import datetime
+import jira
 import os
 import pytz
 import re
+import requests
+import sys
 import time
 import traceback
 import zulip
@@ -16,14 +18,55 @@ JIRA_URL = ("https://issues.apache.org/jira/rest/api/2/search?"
             "expand=changelog&"
             "fields=changelog,summary,creator,description")
 
+JIRA_API_BASE = "https://issues.apache.org/jira"
 JIRA_USERNAME = os.environ['APACHE_JIRA_USERNAME']
 JIRA_PASS = os.environ['APACHE_JIRA_PASSWORD']
 DESCRIPTION_LIMIT = 10000
 OLD_MESSAGES_LOOKBACK = 100
-JIRA_API_LOOKBACK_MINUTES = 60
+JIRA_API_LOOKBACK_MINUTES = 1000
 CHANGE_IGNORED_FIELDS = {'WorklogId', 'timespent', 'RemoteIssueLink',
                          'timeestimate'}
 CHANGE_LOOKBACK_SECONDS = JIRA_API_LOOKBACK_MINUTES * 60
+
+
+class JiraPython:
+
+    def __init__(self):
+        try:
+            self.jira = jira.client.JIRA(options={'server': JIRA_API_BASE},
+                                        basic_auth=(JIRA_USERNAME, JIRA_PASS))
+        except jira.exceptions.JIRAError as e:
+            if "CAPTCHA_CHALLENGE" in e.text:
+                print("")
+                print("It looks like you need to answer a captcha challenge "
+                      "for this account (probably due to a login attempt "
+                      "with an incorrect password). Please log in at "
+                      "https://issues.apache.org/jira and complete the "
+                      "captcha before running this tool again.")
+                print("Exiting.")
+                sys.exit(1)
+            raise e
+
+    def maybe_set_in_progress(self, jira_id):
+        issue = self.jira.issue(jira_id)
+        assignee = issue.fields.assignee
+        if assignee is None:
+            # No assignee, do not set to in progress
+            return
+
+        fields = issue.fields
+        cur_status = fields.status.name
+
+        # If the status is something other than Open, do not do any transitions
+        if cur_status != 'Open':
+            return
+
+        resolve = [x for x in self.jira.transitions(jira_id)
+                   if x['name'] == "Start Progress"][0]
+        self.jira.transition_issue(jira_id, resolve["id"])
+
+        # Change the assignee back to whatever it was originally
+        self.jira.assign_issue(issue, assignee.key)
 
 
 class ZulipJiraBot:
@@ -37,6 +80,8 @@ class ZulipJiraBot:
 
         self.jira_rest_url = JIRA_URL % (self.jira_project,
                                          JIRA_API_LOOKBACK_MINUTES)
+
+        self.jira_python = JiraPython()
 
         self.client = zulip.Client(email=self.email, api_key=self.api_key,
                                    site=self.site)
@@ -200,6 +245,11 @@ class ZulipJiraBot:
             to_string = item.get('toString')
 
             to_string = to_string or field_defaults.get(field, "(empty)")
+
+            if field == 'labels' and 'pull-request-available' in to_string:
+                # When a pull request is opened, set the status of the PR to In
+                # Progress if it has an assignee
+                self.jira_python.maybe_set_in_progress(key)
 
             if from_string is None:
                 line = '* Changed {} to **{}**'.format(field, to_string)
