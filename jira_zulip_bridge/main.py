@@ -19,8 +19,8 @@ JIRA_URL = ("https://issues.apache.org/jira/rest/api/2/search?"
             "fields=changelog,summary,creator,description")
 
 JIRA_API_BASE = "https://issues.apache.org/jira"
-JIRA_USERNAME = os.environ['APACHE_JIRA_USERNAME']
-JIRA_PASS = os.environ['APACHE_JIRA_PASSWORD']
+JIRA_USERNAME = os.environ['JIRA_BOT_USERNAME']
+JIRA_PASS = os.environ['JIRA_BOT_PASSWORD']
 DESCRIPTION_LIMIT = 10000
 OLD_MESSAGES_LOOKBACK = 100
 JIRA_API_LOOKBACK_MINUTES = 1000
