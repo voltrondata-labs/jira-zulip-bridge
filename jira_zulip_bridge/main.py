@@ -66,7 +66,7 @@ class JiraPython:
         self.jira.transition_issue(jira_id, resolve["id"])
 
         # Change the assignee back to whatever it was originally
-        self.jira.assign_issue(issue, assignee.key)
+        self.jira.assign_issue(issue, assignee.name)
 
 
 class ZulipJiraBot:
