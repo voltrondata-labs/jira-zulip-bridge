@@ -8,6 +8,7 @@ import pytz
 import re
 import requests
 import sys
+import threading
 import time
 import traceback
 import zulip
@@ -317,22 +318,35 @@ def _issue_markdown_link(title, key):
             .format(title, key))
 
 
+def _now_string():
+    now = datetime.datetime.now(pytz.utc)
+    return now.strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
+def _process_latest(bot):
+    print("{}: Processing latest events".format(_now_string()))
+    try:
+        bot.process_latest()
+    except Exception:
+        traceback.print_exc()
+    print("{}: Successfully processed latest events.".format(_now_string()))
+
+
 if __name__ == '__main__':
     EMAIL = 'helper-bot@zulipchat.com'
     API_KEY = os.environ['ZULIP_JIRA_API_KEY']
     PROJECT = 'ARROW'
     STREAM = 'jira'
     ZULIP_SITE = 'https://ursalabs.zulipchat.com'
+    ITERATION_TIME_LIMIT = 300
 
     bot = ZulipJiraBot(ZULIP_SITE, EMAIL, API_KEY, PROJECT, STREAM)
 
     while True:
-        now = datetime.datetime.now(pytz.utc)
-        print("{}: Processing latest events"
-              .format(now.strftime("%Y-%m-%d %H:%M:%S %Z")))
-        try:
-            bot.process_latest()
-        except Exception:
-            traceback.print_exc()
-
+        t = threading.Thread(target=lambda: _process_latest(bot))
+        t.start()
+        t.join(timeout=ITERATION_TIME_LIMIT)
+        if t.is_alive():
+            print("Thread timed out after {0} seconds"
+                  .format(ITERATION_TIME_LIMIT))
         time.sleep(5)
